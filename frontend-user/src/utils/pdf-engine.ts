@@ -31,7 +31,7 @@ export interface PdfjsPage {
 export interface PdfjsDocument {
   numPages: number
   getPage(pageNumber: number): Promise<PdfjsPage>
-  destroy(): void
+  destroy(): Promise<void> | void
 }
 
 /** PDF.js TextContent */
@@ -103,7 +103,10 @@ declare global {
   interface Window {
     pdfjsLib?: {
       GlobalWorkerOptions: { workerSrc: string }
-      getDocument(params: Record<string, unknown>): { promise: Promise<PdfjsDocument> }
+      getDocument(params: Record<string, unknown>): {
+        promise: Promise<PdfjsDocument>
+        destroy(): Promise<void>
+      }
       renderTextLayer(params: {
         textContent: PdfjsTextContent
         container: HTMLDivElement
@@ -164,15 +167,36 @@ export async function preloadPdfjs(): Promise<void> {
   await ensureReady()
 }
 
-/** 加载 PDF 文档 */
-export async function loadPdfDocument(url: string): Promise<PdfjsDocument> {
+/** 加载 PDF 文档（默认 30 秒超时，避免文件异常时一直转圈） */
+export async function loadPdfDocument(
+  url: string,
+  timeoutMs = 30000,
+): Promise<PdfjsDocument> {
   const pdfjs = await ensureReady()
-  return pdfjs.getDocument({
+  const task = pdfjs.getDocument({
     url,
     cMapUrl: '/pdfjs/cmaps/',
     cMapPacked: true,
     standardFontDataUrl: '/pdfjs/standard_fonts/',
-  }).promise
+  })
+
+  let timer: ReturnType<typeof setTimeout> | null = null
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`文档加载超时（${Math.round(timeoutMs / 1000)} 秒）`)),
+      timeoutMs,
+    )
+  })
+
+  try {
+    return await Promise.race([task.promise, timeout])
+  } catch (e) {
+    // 超时或出错：终止加载任务，避免底层请求/worker 悬挂
+    await task.destroy().catch(() => {})
+    throw e
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }
 
 /** 渲染单页到 Canvas */

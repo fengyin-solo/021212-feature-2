@@ -94,6 +94,12 @@
       </div>
       <div class="toolbar__right">
         <span class="toolbar__hint" v-if="totalPages > 0">可直接选中文字复制</span>
+        <button class="toolbar__btn toolbar__settings-btn" @click="showSettings = !showSettings" title="使用偏好设置">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+        </button>
       </div>
     </header>
 
@@ -176,6 +182,40 @@
         </div>
       </div>
     </main>
+    <Transition name="settings-fade">
+      <div class="settings-overlay" v-if="showSettings" @click.self="showSettings = false">
+        <section class="settings-panel" role="dialog" aria-label="使用偏好设置">
+          <header class="settings-panel__header">
+            <h2 class="settings-panel__title">使用偏好设置</h2>
+            <button class="settings-panel__close" @click="showSettings = false" title="关闭">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
+                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+            </button>
+          </header>
+          <div class="settings-panel__body">
+            <label
+              v-for="item in settingItems" :key="item.key"
+              class="settings-item"
+            >
+              <span class="settings-item__text">
+                <span class="settings-item__label">{{ item.label }}</span>
+                <span class="settings-item__desc">{{ item.desc }}</span>
+              </span>
+              <button
+                type="button"
+                class="settings-switch"
+                :class="{ 'settings-switch--on': settings[item.key] }"
+                role="switch"
+                :aria-checked="settings[item.key]"
+                @click="toggleSetting(item.key)"
+              ><span class="settings-switch__thumb"/></button>
+            </label>
+          </div>
+          <footer class="settings-panel__footer">设置仅保存在本机浏览器，重新打开后自动生效。</footer>
+        </section>
+      </div>
+    </Transition>
     <Transition name="toast">
       <div class="toast" v-if="toastMsg" :class="`toast--${toastType}`">{{ toastMsg }}</div>
     </Transition>
@@ -191,6 +231,11 @@ import {
   type PdfjsDocument, type PdfjsPage, type PdfjsViewport,
   type SearchResult, type SearchMatch, type PageSearchResult,
 } from '@/utils/pdf-engine'
+import {
+  getSettings, saveSettings, getFileState, saveFileState,
+  getLastOpened, setLastOpened, DEFAULT_SCALE,
+  type ReaderSettings,
+} from '@/utils/reader-settings'
 
 const sampleFiles = [
   { name: 'sample.pdf', label: '示例一：学术论文' },
@@ -198,10 +243,26 @@ const sampleFiles = [
   { name: 'document.pdf', label: '示例三：图文混排' },
 ]
 
+/* ---- 使用偏好（本地持久化） ---- */
+const showSettings = ref(false)
+const settings = reactive<ReaderSettings>(getSettings())
+const settingItems = [
+  { key: 'autoOpenLastFile', label: '自动打开上次文件', desc: '重新打开阅读器时，自动加载上次查看的示例文件' },
+  { key: 'rememberPage', label: '记住阅读位置', desc: '下次打开同一文件时，自动回到上次阅读的页码' },
+  { key: 'restoreZoom', label: '恢复缩放比例', desc: '下次打开同一文件时，自动恢复上次使用的缩放比例' },
+] as const
+
+function toggleSetting(key: typeof settingItems[number]['key']) {
+  settings[key] = !settings[key]
+  saveSettings({ [key]: settings[key] })
+  // 关闭某项时立即按新开关同步一次当前文件的本地记录
+  persistCurrentState()
+}
+
 /* ---- 响应式状态 ---- */
 const pdfDoc = ref<PdfjsDocument | null>(null)
 const totalPages = ref(0)
-const scale = ref(1.5)
+const scale = ref(DEFAULT_SCALE)
 const loading = ref(false)
 const errorMsg = ref('')
 const fileName = ref('')
@@ -264,10 +325,10 @@ function setHighlightLayerRef(el: HTMLDivElement | null, n: number) { if (el) hi
 function setPageRef(el: HTMLElement | null, n: number) { if (el) pageWrapperRefs.set(n, el) }
 
 /* ---- Toast ---- */
-function showToast(msg: string, type: 'success' | 'error' | 'info' = 'info') {
+function showToast(msg: string, type: 'success' | 'error' | 'info' = 'info', duration = 3000) {
   toastMsg.value = msg; toastType.value = type
   if (toastTimer) clearTimeout(toastTimer)
-  toastTimer = setTimeout(() => { toastMsg.value = '' }, 3000)
+  toastTimer = setTimeout(() => { toastMsg.value = '' }, duration)
 }
 
 /* ---- 搜索功能 ---- */
@@ -658,8 +719,66 @@ watch(scale, async () => {
   }
 })
 
+/* ---- 阅读状态本地持久化 ---- */
+
+/** 当前已加载文件的持久化 key；换文件时随之更换，记录互不串用 */
+let currentFileKey = ''
+
+/** 文件 key：示例文件按文件名；本机文件加大小和修改时间，同名不同文件可区分 */
+function makeFileKey(kind: 'sample' | 'local', name: string, size?: number, lastModified?: number) {
+  if (kind === 'local') return `local:${name}:${size ?? 0}:${lastModified ?? 0}`
+  return `sample:${name}`
+}
+
+function persistCurrentState() {
+  if (!currentFileKey || !pdfDoc.value) return
+  const patch: { page?: number; scale?: number } = {}
+  if (settings.rememberPage) patch.page = currentVisiblePage.value
+  if (settings.restoreZoom) patch.scale = +scale.value.toFixed(2)
+  saveFileState(currentFileKey, patch)
+}
+
+let persistTimer: ReturnType<typeof setTimeout> | null = null
+function schedulePersist() {
+  if (persistTimer) clearTimeout(persistTimer)
+  persistTimer = setTimeout(persistCurrentState, 400)
+}
+
+/** 立即把当前文件的阅读状态写入本机（切换文件、关闭页面前调用） */
+function flushCurrentState() {
+  if (persistTimer) { clearTimeout(persistTimer); persistTimer = null }
+  persistCurrentState()
+}
+
+/** 跳转到指定页（按容器内页面对齐，渲染完成前后均可调用） */
+function scrollToPage(pageNum: number) {
+  const c = containerRef.value
+  const wrapper = pageWrapperRefs.get(pageNum)
+  if (!c || !wrapper) return
+  c.scrollTop = Math.max(0, wrapper.offsetTop - 24)
+  currentVisiblePage.value = pageNum
+}
+
+/** 加载代次：超时/失败后忽略迟到的底层回调，防止状态串到新加载 */
+let loadSession = 0
+
 /* ---- 加载 PDF ---- */
-async function loadPdf(url: string) {
+interface PdfSource {
+  url: string
+  kind: 'sample' | 'local'
+  name: string
+  size?: number
+  lastModified?: number
+  /** 启动自动恢复场景：失败时回到空状态并用 toast 说明，不弹阻断式错误卡片 */
+  autoRestore?: boolean
+}
+
+async function loadPdf(source: PdfSource) {
+  const session = ++loadSession
+
+  // 切换文件前先把上一份文件的最新进度落盘，避免 400ms 防抖期间丢失
+  flushCurrentState()
+
   loading.value = true; errorMsg.value = ''
   renderVersion++; renderQueue = []
   renderedPages.clear(); renderedPageOrder.length = 0
@@ -681,36 +800,91 @@ async function loadPdf(url: string) {
   })
   expandedPages.clear()
 
+  // 按文件 key 读取该文件自己的记录，不同文件互不影响
+  const fileKey = makeFileKey(source.kind, source.name, source.size, source.lastModified)
+  currentFileKey = fileKey
+  fileName.value = source.name
+  const saved = getFileState(fileKey)
+
+  // 缩放先于 doc 赋值设置，loading 期间不会触发多余重渲染
+  const targetScale = settings.restoreZoom && saved ? saved.scale : DEFAULT_SCALE
+  scale.value = Math.min(5, Math.max(0.25, targetScale))
+
+  const oldDoc = pdfDoc.value
+  pdfDoc.value = null
+  Promise.resolve(oldDoc?.destroy()).catch(() => {})
+
   try {
-    const doc = await loadPdfDocument(url)
+    const doc = await loadPdfDocument(source.url)
+    if (session !== loadSession) { Promise.resolve(doc.destroy()).catch(() => {}); return }
+
     pdfDoc.value = doc
     totalPages.value = doc.numPages
-    currentVisiblePage.value = 1
     await precomputePageDimensions()
+    if (session !== loadSession) return
+
     loading.value = false
-    showToast(`加载成功，共 ${doc.numPages} 页`, 'success')
+
+    // 恢复该文件自己的阅读页码；页码超出范围（如文件被换成新版本）则回到第一页并说明
+    let page = 1
+    let pageOutOfRange = false
+    if (settings.rememberPage && saved && saved.page > 1) {
+      if (saved.page <= doc.numPages) {
+        page = saved.page
+      } else {
+        pageOutOfRange = true
+      }
+    }
+    currentVisiblePage.value = page
+
+    setLastOpened({ kind: source.kind, name: source.name, key: fileKey })
+
     await nextTick()
+    scrollToPage(page)
     setTimeout(scheduleRender, 50)
+
+    if (pageOutOfRange) {
+      showToast(`上次记录的第 ${saved!.page} 页超出当前文件范围（共 ${doc.numPages} 页），已回到开头`, 'info', 5000)
+    } else if (page > 1) {
+      showToast(`已恢复到第 ${page} 页，缩放 ${Math.round(scale.value * 100)}%`, 'success')
+    } else {
+      showToast(`加载成功，共 ${doc.numPages} 页`, 'success')
+    }
   } catch (e: unknown) {
+    if (session !== loadSession) return
     loading.value = false
+    pdfDoc.value = null
+    totalPages.value = 0
+    currentFileKey = ''
     const msg = e instanceof Error ? e.message : String(e)
-    errorMsg.value = `PDF 加载失败: ${msg}`
-    showToast('加载失败', 'error')
+    if (source.autoRestore) {
+      // 自动打开的文件已不存在或无法加载：回到开头（空状态）并给出说明
+      fileName.value = ''
+      setLastOpened(null)
+      showToast(`上次的文件「${source.name}」已无法打开（${msg}），已回到开头，请重新选择文件`, 'info', 6000)
+    } else {
+      errorMsg.value = `PDF 加载失败: ${msg}`
+      showToast('加载失败，已回到开头', 'error', 5000)
+    }
     console.error('PDF 加载失败:', e)
   }
 }
 
 function loadSample(name: string) {
-  fileName.value = name
-  loadPdf(`/${name}`)
+  loadPdf({ url: `/${name}`, kind: 'sample', name })
 }
 
 function onFileChange(e: Event) {
-  const f = (e.target as HTMLInputElement).files?.[0]
+  const input = e.target as HTMLInputElement
+  const f = input.files?.[0]
   if (!f) return
   if (f.type !== 'application/pdf') { showToast('请选择 PDF 文件', 'error'); return }
-  fileName.value = f.name
-  loadPdf(URL.createObjectURL(f))
+  loadPdf({
+    url: URL.createObjectURL(f), kind: 'local', name: f.name,
+    size: f.size, lastModified: f.lastModified,
+  })
+  // 允许再次选择同一个文件时仍触发 change
+  input.value = ''
 }
 
 function onDragOver(e: DragEvent) { e.preventDefault(); e.stopPropagation() }
@@ -718,24 +892,67 @@ function onDrop(e: DragEvent) {
   e.preventDefault(); e.stopPropagation()
   const f = e.dataTransfer?.files?.[0]
   if (!f || f.type !== 'application/pdf') { showToast('请拖入 PDF 文件', 'error'); return }
-  fileName.value = f.name
-  loadPdf(URL.createObjectURL(f))
+  loadPdf({
+    url: URL.createObjectURL(f), kind: 'local', name: f.name,
+    size: f.size, lastModified: f.lastModified,
+  })
+}
+
+/**
+ * 启动时自动恢复：
+ * - 示例文件：直接按记录的页码/缩放自动打开
+ * - 本机文件：blob 地址刷新后已失效，无法自动打开，回到空状态并说明
+ * - 文件不存在 / 加载失败：由 loadPdf 回退到开头并提示，不会一直转圈
+ */
+async function restoreLastSession() {
+  if (!settings.autoOpenLastFile) return
+  const last = getLastOpened()
+  if (!last) return
+
+  if (last.kind === 'sample') {
+    await loadPdf({ url: `/${last.name}`, kind: 'sample', name: last.name, autoRestore: true })
+    return
+  }
+
+  // 本机文件无法在重新打开后继续访问，给出说明并停在开头（空状态）
+  setLastOpened(null)
+  showToast(`上次阅读的本机文件「${last.name}」已无法自动打开，请重新选择该文件`, 'info', 5000)
+}
+
+function onBeforeUnload() {
+  flushCurrentState()
+}
+
+function onKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape' && showSettings.value) showSettings.value = false
 }
 
 onMounted(() => {
   document.addEventListener('dragover', onDragOver)
   document.addEventListener('drop', onDrop)
-  preloadPdfjs().catch(() => {})
+  window.addEventListener('beforeunload', onBeforeUnload)
+  document.addEventListener('keydown', onKeydown)
+  preloadPdfjs().then(restoreLastSession).catch(() => {})
 })
 
 onUnmounted(() => {
   document.removeEventListener('dragover', onDragOver)
   document.removeEventListener('drop', onDrop)
+  window.removeEventListener('beforeunload', onBeforeUnload)
+  document.removeEventListener('keydown', onKeydown)
   if (toastTimer) clearTimeout(toastTimer)
+  if (persistTimer) clearTimeout(persistTimer)
   if (scrollRafId) cancelAnimationFrame(scrollRafId)
   searchCancelled.value = true
+  loadSession++
   renderVersion++
+  flushCurrentState()
   pdfDoc.value?.destroy()
+})
+
+/* ---- 页码 / 缩放变化时防抖写入本机，只记录当前文件，不影响其他文件 ---- */
+watch([currentVisiblePage, scale], () => {
+  if (pdfDoc.value) schedulePersist()
 })
 </script>
 
@@ -1016,4 +1233,58 @@ onUnmounted(() => {
   position: absolute; top: 0; left: 0; right: 0; bottom: 0;
   pointer-events: none; z-index: 4;
 }
+
+/* ---- 使用偏好设置 ---- */
+.settings-overlay {
+  position: fixed; inset: 0; z-index: 900;
+}
+.settings-panel {
+  position: absolute; top: 64px; right: 16px;
+  width: 340px; background: var(--card-bg);
+  border: 1px solid var(--border-color); border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  display: flex; flex-direction: column; overflow: hidden;
+  &__header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 16px; border-bottom: 1px solid var(--border-color);
+  }
+  &__title { font-size: var(--font-size-lg); font-weight: 600; color: var(--text-primary); }
+  &__close {
+    display: flex; align-items: center; justify-content: center;
+    width: 26px; height: 26px; border: none; background: transparent;
+    color: var(--text-tertiary); cursor: pointer;
+    border-radius: var(--radius-sm); transition: all 0.2s;
+    &:hover { background: var(--bg-color); color: var(--text-primary); }
+  }
+  &__body { padding: 8px 0; }
+  &__footer {
+    padding: 10px 16px; border-top: 1px solid var(--border-color);
+    font-size: var(--font-size-sm); color: var(--text-tertiary);
+    background: var(--bg-color);
+  }
+}
+.settings-item {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 16px; cursor: pointer;
+  transition: background 0.2s;
+  &:hover { background: var(--bg-color); }
+  &__text { flex: 1; display: flex; flex-direction: column; gap: 2px; }
+  &__label { font-size: var(--font-size-base); color: var(--text-primary); }
+  &__desc { font-size: var(--font-size-sm); color: var(--text-tertiary); line-height: 1.4; }
+}
+.settings-switch {
+  position: relative; flex-shrink: 0;
+  width: 40px; height: 22px; border-radius: 11px;
+  border: none; background: #d9d9d9; cursor: pointer;
+  transition: background 0.2s;
+  &__thumb {
+    position: absolute; top: 2px; left: 2px;
+    width: 18px; height: 18px; border-radius: 50%;
+    background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+    transition: transform 0.2s;
+  }
+  &--on { background: var(--primary-color); .settings-switch__thumb { transform: translateX(18px); } }
+}
+.settings-fade-enter-active, .settings-fade-leave-active { transition: opacity 0.2s ease; }
+.settings-fade-enter-from, .settings-fade-leave-to { opacity: 0; }
 </style>
