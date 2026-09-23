@@ -94,6 +94,18 @@
       </div>
       <div class="toolbar__right">
         <span class="toolbar__hint" v-if="totalPages > 0">可直接选中文字复制</span>
+        <button
+          ref="settingsBtnRef"
+          class="toolbar__btn"
+          :class="{ 'toolbar__btn--active': showSettings }"
+          title="阅读设置"
+          @click="showSettings = !showSettings"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+        </button>
       </div>
     </header>
 
@@ -179,6 +191,14 @@
     <Transition name="toast">
       <div class="toast" v-if="toastMsg" :class="`toast--${toastType}`">{{ toastMsg }}</div>
     </Transition>
+
+    <SettingsPanel
+      v-model:open="showSettings"
+      :settings="settings"
+      :anchor-el="settingsBtnRef"
+      @change="onSettingChange"
+      @reset="onResetRecords"
+    />
   </div>
 </template>
 
@@ -191,6 +211,13 @@ import {
   type PdfjsDocument, type PdfjsPage, type PdfjsViewport,
   type SearchResult, type SearchMatch, type PageSearchResult,
 } from '@/utils/pdf-engine'
+import SettingsPanel from '@/components/SettingsPanel.vue'
+import {
+  loadSettings, saveSettings, loadFileState, saveFileState, clearFileState,
+  loadLastFile, saveLastFile, clearLastFile, clearAllRecords,
+  getLocalFileKey, getSampleFileKey, clampScale,
+  DEFAULT_SCALE, type ViewerSettings,
+} from '@/utils/storage'
 
 const sampleFiles = [
   { name: 'sample.pdf', label: '示例一：学术论文' },
@@ -208,6 +235,11 @@ const fileName = ref('')
 const currentVisiblePage = ref(1)
 const toastMsg = ref('')
 const toastType = ref<'success' | 'error' | 'info'>('info')
+
+/* ---- 阅读偏好（本机持久化） ---- */
+const settings = reactive<ViewerSettings>(loadSettings())
+const showSettings = ref(false)
+const settingsBtnRef = ref<HTMLElement | null>(null)
 
 const containerRef = ref<HTMLElement | null>(null)
 const searchInputRef = ref<HTMLInputElement | null>(null)
@@ -255,6 +287,12 @@ let toastTimer: ReturnType<typeof setTimeout> | null = null
 let renderVersion = 0
 let scrollRafId: number | null = null
 let highlightVersion = 0
+
+/* ---- 当前打开文件的持久化信息（按文件隔离页码/缩放，不随视图更新） ---- */
+let currentFileKey = ''
+let currentObjectUrl: string | null = null
+let stateSaveTimer: ReturnType<typeof setTimeout> | null = null
+let loadToken = 0
 
 /* ---- Ref 绑定 ---- */
 function setCanvasRef(el: HTMLCanvasElement | null, n: number) { if (el) canvasRefs.set(n, el) }
@@ -656,11 +694,114 @@ watch(scale, async () => {
   if (searchResult.totalMatches > 0) {
     refreshHighlights()
   }
+  schedulePersistState()
 })
 
+/* ---- 当前阅读页变化时自动记录（仅在开关开启时落盘） ---- */
+watch(currentVisiblePage, () => {
+  if (pdfDoc.value && settings.rememberPage) schedulePersistState()
+})
+
+/* ---- 阅读状态持久化（每个文件独立保存，换文件互不干扰） ---- */
+
+/** 合并保存当前文件的页码/缩放；只持久化开关允许的字段 */
+function persistCurrentState() {
+  if (!currentFileKey) return
+  const next = {
+    page: settings.rememberPage ? currentVisiblePage.value : null,
+    scale: settings.rememberScale ? clampScale(scale.value) : null,
+  }
+  if (next.page === null && next.scale === null) {
+    clearFileState(currentFileKey)
+  } else {
+    saveFileState(currentFileKey, next)
+  }
+}
+
+function schedulePersistState() {
+  if (stateSaveTimer) clearTimeout(stateSaveTimer)
+  stateSaveTimer = setTimeout(() => {
+    stateSaveTimer = null
+    persistCurrentState()
+  }, 400)
+}
+
+/* ---- 设置变更 ---- */
+function onSettingChange(key: keyof ViewerSettings, value: boolean) {
+  settings[key] = value
+  saveSettings({ ...settings })
+
+  if (key === 'rememberPage' || key === 'rememberScale') {
+    if (currentFileKey) {
+      // 立即按新开关重写当前文件记录；关闭时对应字段被清除
+      persistCurrentState()
+    }
+  }
+  if (key === 'autoOpenLastFile') {
+    if (value && currentFileKey) {
+      saveLastFile({
+        kind: currentFileKey.startsWith('local:') ? 'local' : 'sample',
+        key: currentFileKey,
+        name: fileName.value,
+        updatedAt: Date.now(),
+      })
+    } else if (!value) {
+      clearLastFile()
+    }
+  }
+}
+
+function onResetRecords() {
+  clearAllRecords()
+  Object.assign(settings, loadSettings())
+  showSettings.value = false
+  showToast('已清除全部本机阅读记录', 'success')
+}
+
+/** 滚动定位到指定页（基于视口矩形换算，缩放后也准确） */
+function scrollToPage(page: number) {
+  const c = containerRef.value
+  const wrapper = pageWrapperRefs.get(page)
+  if (!c || !wrapper) return
+  const top = wrapper.getBoundingClientRect().top - c.getBoundingClientRect().top + c.scrollTop
+  c.scrollTop = top - 24
+}
+
+/** 带超时的文档加载，避免异常情况下一直停留在转圈状态 */
+async function loadDocumentWithTimeout(url: string, timeoutMs = 20000) {
+  const docPromise = loadPdfDocument(url)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('加载超时，请检查文件或网络后重试')), timeoutMs)
+  })
+  try {
+    return await Promise.race([docPromise, timeout])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 /* ---- 加载 PDF ---- */
-async function loadPdf(url: string) {
-  loading.value = true; errorMsg.value = ''
+
+interface OpenDocOptions {
+  /** 是否尝试恢复该文件上次的页码/缩放（手动换文件同样支持恢复） */
+  restore?: boolean
+  /** 启动时自动打开（失败/失效时回到欢迎页并说明，不显示错误卡片） */
+  auto?: boolean
+}
+
+async function openDocument(url: string, fileKey: string, displayName: string, options: OpenDocOptions = {}) {
+  const { restore = true, auto = false } = options
+  const token = ++loadToken
+
+  // 释放上一个本机文件的 ObjectURL，避免内存泄漏
+  if (currentObjectUrl) { URL.revokeObjectURL(currentObjectUrl); currentObjectUrl = null }
+  if (url.startsWith('blob:')) currentObjectUrl = url
+
+  loading.value = true
+  errorMsg.value = ''
+  const oldDoc = pdfDoc.value
+  pdfDoc.value = null
   renderVersion++; renderQueue = []
   renderedPages.clear(); renderedPageOrder.length = 0
   pageDimensions.clear(); pageBaseDims.clear()
@@ -681,36 +822,117 @@ async function loadPdf(url: string) {
   })
   expandedPages.clear()
 
+  /* 读取该文件独立的阅读状态（换文件不会串），先确定缩放再加载 */
+  const savedState = restore ? loadFileState(fileKey) : null
+  const savedScale = settings.rememberScale && savedState?.scale != null
+    ? clampScale(savedState.scale)
+    : DEFAULT_SCALE
+  if (scale.value !== savedScale) scale.value = savedScale
+
+  let doc: PdfjsDocument
   try {
-    const doc = await loadPdfDocument(url)
-    pdfDoc.value = doc
-    totalPages.value = doc.numPages
-    currentVisiblePage.value = 1
-    await precomputePageDimensions()
-    loading.value = false
-    showToast(`加载成功，共 ${doc.numPages} 页`, 'success')
-    await nextTick()
-    setTimeout(scheduleRender, 50)
+    doc = await loadDocumentWithTimeout(url)
   } catch (e: unknown) {
+    if (token !== loadToken) return // 已切换到其他文件，忽略结果
+    oldDoc?.destroy()
     loading.value = false
     const msg = e instanceof Error ? e.message : String(e)
-    errorMsg.value = `PDF 加载失败: ${msg}`
-    showToast('加载失败', 'error')
+    if (auto) {
+      // 自动恢复失败：回到开头（欢迎页）并说明，不停留在转圈
+      currentFileKey = ''
+      clearLastFile()
+      showToast(`上次阅读的文件「${displayName}」已无法打开，已回到起始页`, 'info')
+    } else {
+      errorMsg.value = `PDF 加载失败: ${msg}`
+      showToast('加载失败', 'error')
+    }
     console.error('PDF 加载失败:', e)
+    return
+  }
+
+  if (token !== loadToken) { // 加载期间已切换文件，丢弃本次结果
+    doc.destroy()
+    return
+  }
+
+  // 新文档就绪后销毁旧文档，释放 worker 与内存
+  oldDoc?.destroy()
+  pdfDoc.value = doc
+  totalPages.value = doc.numPages
+  await precomputePageDimensions()
+
+  /* 页码恢复：越界（文件被替换、页数变少）时回到开头并说明 */
+  let targetPage = 1
+  let pageFallback = false
+  const savedPage = settings.rememberPage ? savedState?.page : null
+  if (savedPage != null && Number.isFinite(savedPage)) {
+    if (savedPage >= 1 && savedPage <= doc.numPages) {
+      targetPage = Math.floor(savedPage)
+    } else {
+      pageFallback = true
+    }
+  }
+  currentVisiblePage.value = targetPage
+
+  currentFileKey = fileKey
+  fileName.value = displayName
+
+  // 记录“上次打开的文件”，供下次启动按设置自动恢复
+  saveLastFile({
+    kind: fileKey.startsWith('local:') ? 'local' : 'sample',
+    key: fileKey,
+    name: displayName,
+    updatedAt: Date.now(),
+  })
+
+  loading.value = false
+  await nextTick()
+
+  if (targetPage > 1) {
+    // 先定位再触发渲染，避免先闪第 1 页再跳转
+    scrollToPage(targetPage)
+  } else if (containerRef.value) {
+    containerRef.value.scrollTop = 0
+  }
+  scheduleRender()
+
+  if (auto && targetPage > 1) {
+    showToast(`已恢复到「${displayName}」第 ${targetPage} 页`, 'success')
+  } else if (pageFallback) {
+    showToast('记录的页码超出当前文件范围，已回到开头', 'info')
+  } else if (!auto) {
+    showToast(`加载成功，共 ${doc.numPages} 页`, 'success')
+  }
+}
+
+/** 启动时按设置自动恢复上次的文件 */
+async function restoreLastSession() {
+  if (!settings.autoOpenLastFile) return
+  const last = loadLastFile()
+  if (!last) return
+
+  if (last.kind === 'sample') {
+    // 示例文件以 public 下固定路径加载；加载失败时 openDocument 会回退并说明
+    const name = last.key.startsWith('sample:') ? last.key.slice('sample:'.length) : last.name
+    await openDocument(`/${name}`, getSampleFileKey(name), last.name || name, { auto: true, restore: true })
+  } else {
+    // 本机文件无法在重新打开后自动访问（浏览器安全限制），回到开头并说明
+    clearLastFile()
+    showToast(`上次的本机文件「${last.name}」需要重新选择后才能打开`, 'info')
   }
 }
 
 function loadSample(name: string) {
-  fileName.value = name
-  loadPdf(`/${name}`)
+  openDocument(`/${name}`, getSampleFileKey(name), name)
 }
 
 function onFileChange(e: Event) {
   const f = (e.target as HTMLInputElement).files?.[0]
   if (!f) return
   if (f.type !== 'application/pdf') { showToast('请选择 PDF 文件', 'error'); return }
-  fileName.value = f.name
-  loadPdf(URL.createObjectURL(f))
+  openDocument(URL.createObjectURL(f), getLocalFileKey(f), f.name)
+  // 允许再次选择同一个文件
+  ;(e.target as HTMLInputElement).value = ''
 }
 
 function onDragOver(e: DragEvent) { e.preventDefault(); e.stopPropagation() }
@@ -718,23 +940,35 @@ function onDrop(e: DragEvent) {
   e.preventDefault(); e.stopPropagation()
   const f = e.dataTransfer?.files?.[0]
   if (!f || f.type !== 'application/pdf') { showToast('请拖入 PDF 文件', 'error'); return }
-  fileName.value = f.name
-  loadPdf(URL.createObjectURL(f))
+  openDocument(URL.createObjectURL(f), getLocalFileKey(f), f.name)
+}
+
+function onKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape' && showSettings.value) showSettings.value = false
 }
 
 onMounted(() => {
   document.addEventListener('dragover', onDragOver)
   document.addEventListener('drop', onDrop)
-  preloadPdfjs().catch(() => {})
+  document.addEventListener('keydown', onKeydown)
+  preloadPdfjs()
+    .then(restoreLastSession)
+    .catch(() => {})
 })
 
 onUnmounted(() => {
   document.removeEventListener('dragover', onDragOver)
   document.removeEventListener('drop', onDrop)
+  document.removeEventListener('keydown', onKeydown)
   if (toastTimer) clearTimeout(toastTimer)
+  if (stateSaveTimer) clearTimeout(stateSaveTimer)
   if (scrollRafId) cancelAnimationFrame(scrollRafId)
   searchCancelled.value = true
   renderVersion++
+  loadToken++
+  // 离开前把当前阅读位置落盘，下次打开可恢复
+  persistCurrentState()
+  if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl)
   pdfDoc.value?.destroy()
 })
 </script>
@@ -803,6 +1037,7 @@ onUnmounted(() => {
     color: var(--text-primary); cursor: pointer; transition: all 0.2s;
     &:hover:not(:disabled) { border-color: var(--primary-color); color: var(--primary-color); }
     &:disabled { opacity: 0.4; cursor: not-allowed; }
+    &--active { border-color: var(--primary-color); color: var(--primary-color); background: #e6f4ff; }
   }
   &__zoom-value {
     font-size: var(--font-size-sm); color: var(--text-secondary);

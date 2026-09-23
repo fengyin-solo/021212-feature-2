@@ -10,6 +10,12 @@
 - 文件选择和拖拽上传
 - 滚动懒加载 + LRU 页面回收，大文件（200+ 页）不卡顿
 - CMap 和标准字体支持，确保中文等复杂字体正确渲染
+- 阅读偏好设置（保存在本机浏览器 localStorage）：
+  - 自动打开上次阅读的文件
+  - 记住每个文件的阅读位置（页码）
+  - 恢复每个文件上次使用的缩放比例
+  - 文件不存在或记录页码越界时自动回到开头并提示，不会卡在加载状态
+  - 各文件的页码/缩放按文件独立记录，切换文件互不干扰
 
 ## 项目目录结构
 
@@ -33,11 +39,13 @@
 │       ├── App.vue             # 根组件
 │       ├── main.ts             # 应用入口
 │       ├── components/
-│       │   └── PdfViewer.vue   # PDF 阅读器核心组件
+│       │   ├── PdfViewer.vue     # PDF 阅读器核心组件
+│       │   └── SettingsPanel.vue # 阅读偏好设置面板
 │       ├── styles/
-│       │   └── global.scss     # 全局样式
+│       │   └── global.scss       # 全局样式
 │       └── utils/
-│           └── pdf-engine.ts   # PDF.js 引擎封装
+│           ├── pdf-engine.ts     # PDF.js 引擎封装
+│           └── storage.ts        # 阅读偏好/阅读状态本地持久化
 └── README.md                   # 项目说明
 ```
 
